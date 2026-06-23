@@ -1,132 +1,94 @@
-"""TFT electrical parameter extraction (MATLAB Logic Replica + Extrapolation Fallback)."""
-from __future__ import annotations
-from typing import Any
 import numpy as np
 from scipy.signal import savgol_filter
 
 class DeviceExtractor:
-    def __init__(
-        self, config: dict[str, Any], *, width_m: float | None = None, length_m: float | None = None, drain_voltage: float | None = None,
-    ):
-        self.L = float(length_m if length_m is not None else config["L"])
-        self.W = float(width_m if width_m is not None else config["W"])
-        self.Vd = float(drain_voltage if drain_voltage is not None else config["Vd"])
+    """
+    TFT 电学参数提取引擎
+    """
+    Cox: float
 
-        if self.L <= 0 or self.W <= 0:
-            raise ValueError("W 和 L 必须大于 0")
+    def __init__(self, config: dict, *, width_m: float, length_m: float, drain_voltage: float):
+        """
 
-        epsilon0 = 8.854187817e-12
-        c_sin = epsilon0 * float(config["eps_SiN"]) / float(config["T_SiN"])
-        c_sio = epsilon0 * float(config["eps_SiO"]) / float(config["T_SiO"])
-        self.Cox = 1.0 / (1.0 / c_sin + 1.0 / c_sio)
-        self.I_target = (self.W / self.L) * float(config["I0_norm"])
+        :type drain_voltage: float
+        """
+        self.W = width_m
+        self.L = length_m
+        self.Vd = drain_voltage
 
-    @staticmethod
-    def _clean_and_sort(vg: np.ndarray, current: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        vg = np.asarray(vg, dtype=float).reshape(-1)
-        current = np.asarray(current, dtype=float).reshape(-1)
-        mask = np.isfinite(vg) & np.isfinite(current)
-        vg, current = vg[mask], current[mask]
+        # 1. 计算绝缘层电容 Cox [F/m^2]
+        # 公式: Cox = eps_0 * eps_r / tox
+        eps_0 = 8.854e-12
 
-        order = np.argsort(vg, kind="stable")
-        vg, current = vg[order], current[order]
+        t_sin = config["T_SiN"]
+        eps_sin = config["eps_SiN"]
+        t_sio = config["T_SiO"]
+        eps_sio = config["eps_SiO"]
 
-        unique_vg, inverse = np.unique(vg, return_inverse=True)
-        if len(unique_vg) != len(vg):
-            sums = np.zeros_like(unique_vg, dtype=float)
-            counts = np.zeros_like(unique_vg, dtype=float)
-            np.add.at(sums, inverse, current)
-            np.add.at(counts, inverse, 1.0)
-            current = sums / counts
-            vg = unique_vg
-        return vg, current
+        # 两层介质串联：1/Cox = t_SiN/(eps0*eps_SiN) + t_SiO/(eps0*eps_SiO)
+        self.Cox = eps_0 / (t_sin / eps_sin + t_sio / eps_sio)
 
-    def preprocess_data(self, vg: np.ndarray, current: np.ndarray, window_length: int = 7, polyorder: int = 3) -> tuple[np.ndarray, np.ndarray]:
-        vg, current = self._clean_and_sort(vg, current)
-        current_abs = np.abs(current)
-        if len(current_abs) < 3: return vg, current_abs
+        # 2. 定电流法阈值目标值 [A]
+        # I_target = (W/L) * I0_norm
+        self.I_target = (self.W / self.L) * float(config.get('I0_norm', 1e-9))
 
-        window = min(int(window_length), len(current_abs))
-        if window % 2 == 0: window -= 1
-        positive_floor = 1e-30
-        log_current = np.log10(np.maximum(current_abs, positive_floor))
-        smoothed = np.power(10.0, savgol_filter(log_current, window, int(polyorder), mode="interp"))
-        return vg, np.maximum(smoothed, positive_floor)
+    def preprocess_data(self, vg, current, window_length=7):
+        """数据预处理：去除噪声并平滑曲线"""
+        # 取绝对值防止电流为负造成 log 运算报错
+        id_abs = np.abs(current)
 
-    def extract_vth(self, vg: np.ndarray, current: np.ndarray) -> float:
-        """提取 Vth：完美复刻 MATLAB 防抖 + 外推法兜底"""
-        vg, current = self._clean_and_sort(vg, np.abs(current))
-        if len(vg) < 2: return float("nan")
+        # 使用 Savitzky-Golay 滤波器进行平滑
+        # 它通过多项式拟合局部数据，能较好地保留 gm(跨导) 的峰值
+        wl = window_length if window_length % 2 != 0 else window_length + 1
+        id_proc = savgol_filter(id_abs, window_length=wl, polyorder=2)
 
-        current_cummax = np.maximum.accumulate(current)
-        indices = np.flatnonzero(current_cummax >= self.I_target)
+        # 确保电流不为0（避免log运算错误）
+        return vg, np.maximum(id_proc, 1e-15)
 
+    def extract_vth(self, vg, id_proc):
+        """定电流法提取 Vth，增加异常捕获"""
+        # 增加容错：如果数据太短或全是 0，直接返回 NaN
+        if len(vg) < 5 or np.max(id_proc) < self.I_target:
+            return np.nan
 
-        if len(indices) > 0 and indices[0] > 0:
-            k = int(indices[0])
-            v1, v2 = vg[k - 1], vg[k]
-            i1, i2 = current_cummax[k - 1], current_cummax[k]
-            if i2 == i1: return float(v2)
-            return float(v1 + (self.I_target - i1) * (v2 - v1) / (i2 - i1))
+        id_mono = np.maximum.accumulate(id_proc)
+        indices = np.flatnonzero(id_mono >= self.I_target)
 
-
-    def _extract_vg_at_current_log(self, vg, current, v_range, i_target, log_floor=1e-30):
-        mask = (vg >= v_range[0]) & (vg <= v_range[1])
-        vg_sub, id_sub = vg[mask], current[mask]
-        if len(vg_sub) < 2: return float("nan")
-
-        id_cummax = np.maximum.accumulate(id_sub)
-        indices = np.flatnonzero(id_cummax >= i_target)
-        if len(indices) == 0 or indices[0] == 0: return float("nan")
+        if len(indices) == 0:
+            return np.nan
 
         k = indices[0]
-        v1, v2 = vg_sub[k-1], vg_sub[k]
+        if k == 0: return float(vg[0])
 
-        log_i1 = np.log10(id_cummax[k-1] + log_floor)
-        log_i2 = np.log10(id_cummax[k] + log_floor)
-        log_it = np.log10(i_target + log_floor)
+        v1, v2 = vg[k - 1], vg[k]
+        i1, i2 = id_mono[k - 1], id_mono[k]
 
-        if log_i2 == log_i1: return float(v2)
-        return float(v1 + (log_it - log_i1) * (v2 - v1) / (log_i2 - log_i1))
+        # 增加除零保护
+        if abs(i2 - i1) < 1e-20: return float(v2)
 
-    def extract_ss(self, vg: np.ndarray, current: np.ndarray, vth: float, ss_dvg=(-5.0, 0.0), id1_norm=1e-10, id2_norm=1e-9) -> tuple[float, float]:
-        if not np.isfinite(vth): return float("nan"), float("nan")
-        vg, current = self._clean_and_sort(vg, np.abs(current))
+        return float(v1 + (self.I_target - i1) * (v2 - v1) / (i2 - i1))
 
-        i1_target = (self.W / self.L) * id1_norm
-        i2_target = (self.W / self.L) * id2_norm
-        v_range = (vth + ss_dvg[0], vth + ss_dvg[1])
+    def extract_mobility(self, vg, id_proc):
+        """提取迁移率 mu"""
+        # 线性区: mu = (L / W*Cox*Vd) * gm
+        if self.Vd < 1.0:
+            gm = np.gradient(id_proc, vg)
+            gm_max = np.max(gm)
+            mu = (self.L / (self.W * self.Cox * self.Vd)) * gm_max
+        # 饱和区: mu = (2L / W*Cox) * (d(sqrt_Id)/dVg)^2
+        else:
+            sqrt_id = np.sqrt(id_proc)
+            gm_sat = np.gradient(sqrt_id, vg)
+            mu = (2.0 * self.L / (self.W * self.Cox)) * (np.max(gm_sat) ** 2)
 
-        vg1 = self._extract_vg_at_current_log(vg, current, v_range, i1_target)
-        vg2 = self._extract_vg_at_current_log(vg, current, v_range, i2_target)
+        return mu * 1e4, None # 转换为 cm^2/Vs
 
-        if np.isnan(vg1) or np.isnan(vg2): return float("nan"), float("nan")
+    def extract_ss(self, vg, id_proc):
+        """亚阈值摆幅 SS [V/dec]"""
+        # SS = d(Vg) / d(log10(Id)) = 1 / max(d(log10(Id))/dVg)
+        log_id = np.log10(np.maximum(id_proc, 1e-15))
+        dlogId_dVg = np.gradient(log_id, vg)
 
-        ss_val = abs(vg2 - vg1)
-        ss_vg_mid = 0.5 * (vg1 + vg2)
-        return ss_val, ss_vg_mid
-
-    # 注意：这里把 dvg_range 的默认值放宽到了 20.0，防止严重漂移的器件找不到峰值
-    def extract_mobility(self, vg: np.ndarray, current: np.ndarray, vth: float, dvg_range=(1.0, 20.0), gm_smooth_window=3) -> tuple[float, float]:
-        if not np.isfinite(vth) or np.isclose(self.Vd, 0.0): return float("nan"), float("nan")
-
-        vg, current = self._clean_and_sort(vg, np.abs(current))
-        mask = (vg >= vth + dvg_range[0]) & (vg <= vth + dvg_range[1])
-        vg_sub, current_sub = vg[mask], current[mask]
-
-        if len(vg_sub) < 3: return float("nan"), float("nan")
-
-        gm = np.gradient(current_sub, vg_sub)
-
-        if gm_smooth_window > 1 and len(gm) >= gm_smooth_window:
-            window = gm_smooth_window if gm_smooth_window % 2 != 0 else gm_smooth_window + 1
-            gm = savgol_filter(gm, window, 1)
-
-        gm_valid = np.where(np.isfinite(gm), gm, -np.inf)
-        index = int(np.argmax(gm_valid))
-        gm_max = float(gm_valid[index])
-
-        if not np.isfinite(gm_max) or gm_max <= 0: return float("nan"), float("nan")
-
-        mobility_m2 = gm_max / (self.Cox * abs(self.Vd)) * (self.L / self.W)
-        return float(mobility_m2 * 1e4), float(vg_sub[index])
+        max_slope = np.max(dlogId_dVg)
+        if max_slope <= 0: return np.nan, np.nan
+        return 1.0 / max_slope, np.nan
