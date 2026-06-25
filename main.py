@@ -15,7 +15,7 @@ USE_ORIGIN_TEMPLATE = True
 
 
 def main():
-    input_folder = r"F:\SEU\发表论文\GI3成膜优化"
+    input_folder = r"E:\桌面\624"
     save_folder = r"E:\AAAA-MYLAB\TFT\实验结果"
 
     if USE_ORIGIN_TEMPLATE:
@@ -48,11 +48,29 @@ def main():
         print(f"✅ Excel 汇总已生成: {excel_path}")
 
     # ==== 导出 Origin ====
+    # if all_curves_grouped:
+    #     plotter = OriginPlotter(template_path=my_template)
+    #     combined_opju_path = os.path.join(save_folder, "00_多子表_Curves_Combined.opju")
+    #     plotter.plot_multiple_graphs_in_one_project(
+    #         curves_by_group=all_curves_grouped,
+    #         output_path=combined_opju_path
+    #     )
+
     if all_curves_grouped:
         plotter = OriginPlotter(template_path=my_template)
-        combined_opju_path = os.path.join(save_folder, "00_多子表_Curves_Combined.opju")
-        plotter.plot_multiple_graphs_in_one_project(
-            curves_by_group=all_curves_grouped,
+        combined_opju_path = os.path.join(save_folder, "00_单图层_All_Curves_Combined.opju")
+
+        # 🌟 将分组转换为列表，并将曲线重命名防止图例冲突
+        flat_curves_list = []
+        for group_key, curves in all_curves_grouped.items():
+            for curve in curves:
+                # 给曲线名字加上它所属的组名（文件名_表名），防止画在同一张图里时分不清是谁
+                curve['name'] = f"{group_key}_{curve['name']}"
+                flat_curves_list.append(curve)
+
+        # 调用绘制单图层的画图函数，传入平铺后的列表
+        plotter.plot_combined_transfer_curves(
+            curves_data=flat_curves_list,
             output_path=combined_opju_path
         )
 
