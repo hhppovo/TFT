@@ -15,7 +15,7 @@ USE_ORIGIN_TEMPLATE = True
 
 
 def main():
-    input_folder = r"E:\桌面\624"
+    input_folder = r"E:\桌面\第四周\627"
     save_folder = r"E:\AAAA-MYLAB\TFT\实验结果"
 
     if USE_ORIGIN_TEMPLATE:
